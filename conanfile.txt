@@ -1,0 +1,11 @@
+[requires]
+asio/1.24.0
+cppcodec/0.2
+httpparser/0.1
+stduuid/1.2.2
+
+[generators]
+cmake
+
+[options]
+stduuid:with_cxx20_span=True
