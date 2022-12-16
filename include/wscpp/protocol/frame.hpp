@@ -7,7 +7,12 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+#ifndef ASIO_HPP
 #include "asio.hpp"
+#endif
+#include "close_status_codes.hpp"
+#include "converters.hpp"
 #include "header.hpp"
 #include "payload.hpp"
 
@@ -138,6 +143,14 @@ private:
     std::size_t _payload_length;
     std::optional<masking_key> _masking_key = std::nullopt;
     std::optional<payload> _payload = std::nullopt;
+};
+
+auto make_close_frame(short unsigned int close_status_code) {
+    uint16_t_to_uint8_t converter;
+    converter.u16 = close_status_code;
+    uint8_t* payload = converter.u8;
+
+    return frame(std::move(std::vector(payload, payload + 2)), 2, opcode::close, true);
 };
 
 };

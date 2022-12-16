@@ -52,9 +52,26 @@ public:
     void set_binary_message_handler(std::function<void (std::vector<uint8_t>)> handler);
     void set_close_handler(std::function<void ()> handler);
     void set_text_message_handler(std::function<void (std::string)> handler);
-    void start_handshake();
+    void start();
 
+    /**
+     * @brief Write a text frame to the websocket connection. This frame is
+     * pushed to the back of the queue of pending frames. This method acquires
+     * the connection's write lock.
+     *
+     * @param payload String message body.
+     */
     void write(const std::string payload);
+
+    /**
+     * @brief Write a binary frame to the websocket connection. This frame is
+     * pushed to the back of the queue of pending frames. This method acquires
+     * the connection's write lock.
+     * 
+     * @param payload Raw pointer to data array that will be copied into the frame.
+     * @param length Length of the data to be copied.
+     */
+    void write(const void* payload, std::size_t length);
 
     uuids::uuid _id;
     // void write(const void* payload, size_t len);
@@ -109,7 +126,7 @@ void websocket_connection::set_text_message_handler(std::function<void (std::str
     _text_handler = handler;
 };
 
-void websocket_connection::start_handshake()
+void websocket_connection::start()
 {
     _handshake_timer.expires_after(std::chrono::seconds(_handshake_timeout));
     _handshake_timer.async_wait(std::bind(&websocket_connection::handshake_timeout_handler, this, _1));
@@ -459,11 +476,40 @@ void websocket_connection::write(const std::string message) {
     write_pending_frames();
 };
 
+void websocket_connection::write(const void* payload, std::size_t length) {
+    std::vector<protocol::frame> frames;
+    auto first_frame(true);
+    auto ptr = static_cast<const uint8_t*>(payload);
+    auto payload_end = ptr + length;
+    while (ptr < payload_end) {
+        auto end = std::min(ptr + max_frame_size, payload_end);
+        auto last_frame = end == payload_end;
+        std::vector<uint8_t> payload(ptr, end);
+        frames.emplace_back(
+            std::move(payload),
+            payload.size(),
+            first_frame ? protocol::enums::opcode::binary : protocol::enums::opcode::continuation,
+            last_frame
+        );
+
+        ptr = end;
+        first_frame = false;
+    }
+
+    std::lock_guard lock(_write_mutex);
+
+    for (std::size_t i = 0; i < frames.size(); i++){
+        _write_frames.push_back(std::move(frames[i]));
+    }
+
+    write_pending_frames();
+};
+
 /**
  * @brief Asynchronously write pending frames to the underlying socket.
  *
- * This method should only be called from a context where the _write_mutex is
- * already held.
+ * NB: This method should only be called from a context where the _write_mutex
+ * is already held.
  *
  * If a write is already in progress, this method should return. Only one write
  * is allowed at a time.
@@ -496,12 +542,52 @@ void websocket_connection::write_pending_frames() {
     });
 };
 
-void websocket_connection::close_connection(const std::string message) {
-    if (_socket.is_open()) {
-        std::cout << "Closing connection: " << message << std::endl;
-        _socket.cancel();
-        _socket.close();
-    }
-};
+// void websocket_connection::close_connection(short unsigned int close_status_code, const std::string message) {
+//     std::lock_guard lock(_write_mutex);
+
+//     auto close_frame = protocol::make_close_frame(close_status_code);
+
+//     if (_close_sent) {
+//         return;
+//     }
+
+//     _write_frames.clear();
+//     _write_frames.push_back(std::move(close_frame));
+
+//     write_pending_frames();
+
+//     asio::async_write(_socket,
+
+//     auto ptr = static_cast<const uint8_t*>(payload);
+//     auto payload_end = ptr + length;
+//     while (ptr < payload_end) {
+//         auto end = std::min(ptr + max_frame_size, payload_end);
+//         auto last_frame = end == payload_end;
+//         std::vector<uint8_t> payload(ptr, end);
+//         frames.emplace_back(
+//             std::move(payload),
+//             payload.size(),
+//             first_frame ? protocol::enums::opcode::binary : protocol::enums::opcode::continuation,
+//             last_frame
+//         );
+
+//         ptr = end;
+//         first_frame = false;
+//     }
+
+//     std::lock_guard lock(_write_mutex);
+
+//     for (std::size_t i = 0; i < frames.size(); i++){
+//         _write_frames.push_back(std::move(frames[i]));
+//     }
+
+//     write_pending_frames();
+
+//     if (_socket.is_open()) {
+//         std::cout << "Closing connection: " << message << std::endl;
+//         _socket.cancel();
+//         _socket.close();
+//     }
+// };
 
 };

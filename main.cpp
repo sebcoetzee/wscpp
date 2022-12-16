@@ -66,7 +66,7 @@ void tcp_server::accept_callback_handler(const asio::error_code& ec, tcp::socket
     std::cout << "New connection: " << socket.remote_endpoint().address() << ":" << socket.remote_endpoint().port() << std::endl;
     std::shared_ptr<websocket_connection> connection(new websocket_connection({.io_context = _io_context, .socket = std::move(socket)}));
     connection->set_text_message_handler(text_handler);
-    connection->start_handshake();
+    connection->start();
     this->_websocket_connections.insert(connection);
 
     std::cout << "Connections: " << this->_websocket_connections.size() << std::endl;

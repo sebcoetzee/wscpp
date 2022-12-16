@@ -1,9 +1,13 @@
+#pragma once
+
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <limits>
 
+#ifndef ASIO_HPP
 #include "asio.hpp"
+#endif
 
 namespace wscpp {
 namespace protocol {
