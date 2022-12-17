@@ -73,15 +73,17 @@ public:
      */
     void write(const void* payload, std::size_t length);
 
+    void close(short unsigned int close_status_code);
+
     uuids::uuid _id;
     // void write(const void* payload, size_t len);
 private:
-    void close_connection(const std::string message);
     protocol::frame& current_frame();
     void frame_handler(const asio::error_code& ec, std::size_t bytes_transferred);
     void handshake_handler(const asio::error_code& ec, std::size_t bytes_transferred);
     void handshake_timeout_handler(const asio::error_code& ec);
     void keepalive_handler(const asio::error_code& ec);
+    void send_close_frame(bool terminate);
     void send_pong(std::vector<uint8_t> payload);
     void start_keepalive();
     void start_reading();
@@ -115,7 +117,6 @@ private:
     std::deque<protocol::frame> _write_frames;
     std::optional<const protocol::frame> _write_hold_frame;
     std::optional<protocol::enums::opcode> _current_opcode;
-    bool _close_sent;
 };
 
 void websocket_connection::set_binary_message_handler(std::function<void (std::vector<uint8_t>)> handler) {
@@ -533,61 +534,74 @@ void websocket_connection::write_pending_frames() {
         _write_in_progress = false;
 
         if (!ec) {
-            if (_write_frames.size() > 0) {
+            if (_write_hold_frame->get_terminate()) {
+                _socket.cancel();
+                _socket.close();
+
+                // TODO: Call websocket terminate handler
+            } else if (_write_frames.size() > 0) {
                 write_pending_frames();
             }
         } else if (ec.value() != asio::error::operation_aborted) {
-            close_connection(ec.message());
+            // TODO: Log the aborted message
         }
     });
 };
 
-// void websocket_connection::close_connection(short unsigned int close_status_code, const std::string message) {
-//     std::lock_guard lock(_write_mutex);
+void websocket_connection::send_close_frame(short unsigned int close_status_code, bool terminate) {
+    auto close_frame = protocol::make_close_frame(close_status_code);
+    close_frame.set_terminate(terminate);
 
-//     auto close_frame = protocol::make_close_frame(close_status_code);
+    std::lock_guard lock(_write_mutex);
 
-//     if (_close_sent) {
-//         return;
-//     }
+    _write_frames.clear();
+    _write_frames.push_back(std::move(close_frame));
 
-//     _write_frames.clear();
-//     _write_frames.push_back(std::move(close_frame));
+    write_pending_frames();
+};
 
-//     write_pending_frames();
+void websocket_connection::close(short unsigned int close_status_code) {
+    std::lock_guard lock(_write_mutex);
 
-//     asio::async_write(_socket,
+    auto close_frame = protocol::make_close_frame(close_status_code);
 
-//     auto ptr = static_cast<const uint8_t*>(payload);
-//     auto payload_end = ptr + length;
-//     while (ptr < payload_end) {
-//         auto end = std::min(ptr + max_frame_size, payload_end);
-//         auto last_frame = end == payload_end;
-//         std::vector<uint8_t> payload(ptr, end);
-//         frames.emplace_back(
-//             std::move(payload),
-//             payload.size(),
-//             first_frame ? protocol::enums::opcode::binary : protocol::enums::opcode::continuation,
-//             last_frame
-//         );
+    _write_frames.clear();
+    _write_frames.push_back(std::move(close_frame));
 
-//         ptr = end;
-//         first_frame = false;
-//     }
+    write_pending_frames();
 
-//     std::lock_guard lock(_write_mutex);
+    asio::async_write(_socket,
 
-//     for (std::size_t i = 0; i < frames.size(); i++){
-//         _write_frames.push_back(std::move(frames[i]));
-//     }
+    auto ptr = static_cast<const uint8_t*>(payload);
+    auto payload_end = ptr + length;
+    while (ptr < payload_end) {
+        auto end = std::min(ptr + max_frame_size, payload_end);
+        auto last_frame = end == payload_end;
+        std::vector<uint8_t> payload(ptr, end);
+        frames.emplace_back(
+            std::move(payload),
+            payload.size(),
+            first_frame ? protocol::enums::opcode::binary : protocol::enums::opcode::continuation,
+            last_frame
+        );
 
-//     write_pending_frames();
+        ptr = end;
+        first_frame = false;
+    }
 
-//     if (_socket.is_open()) {
-//         std::cout << "Closing connection: " << message << std::endl;
-//         _socket.cancel();
-//         _socket.close();
-//     }
-// };
+    std::lock_guard lock(_write_mutex);
+
+    for (std::size_t i = 0; i < frames.size(); i++){
+        _write_frames.push_back(std::move(frames[i]));
+    }
+
+    write_pending_frames();
+
+    if (_socket.is_open()) {
+        std::cout << "Closing connection: " << message << std::endl;
+        _socket.cancel();
+        _socket.close();
+    }
+};
 
 };

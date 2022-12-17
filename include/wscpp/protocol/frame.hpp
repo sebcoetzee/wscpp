@@ -28,11 +28,12 @@ enum class frame_state {
 
 class frame {
 public:
-    frame() : _state(frame_state::basic_header), _basic_header(basic_header()) {};
+    frame() : _state(frame_state::basic_header), _basic_header(basic_header()), _terminate(false) {};
     frame(std::vector<uint8_t> payload, const std::size_t payload_length, const enums::opcode opcode, bool fin):
         _state(frame_state::payload),
         _basic_header(fin, false, false, false, opcode, false, payload_length > 65535 ? 127 : payload_length > 125 ? 126 : payload_length),
-        _payload(std::move(payload))
+        _payload(std::move(payload)),
+        _terminate(false)
     {
         if (payload_length > 125) {
             _extended_payload_length.emplace(payload_length);
@@ -134,7 +135,15 @@ public:
         std::stringstream stream;
         stream << "Opcode: " << enums::opcode_string(opcode()) << std::endl;
         return stream.str();
-    }
+    };
+
+    bool get_terminate() const {
+        return _terminate;
+    };
+
+    void set_terminate(bool terminate) {
+        _terminate = terminate;
+    };
 
 private:
     frame_state _state;
@@ -143,6 +152,7 @@ private:
     std::size_t _payload_length;
     std::optional<masking_key> _masking_key = std::nullopt;
     std::optional<payload> _payload = std::nullopt;
+    bool _terminate;
 };
 
 auto make_close_frame(short unsigned int close_status_code) {
