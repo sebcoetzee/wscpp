@@ -10,15 +10,15 @@
 #include <array>
 #include <cstdlib>
 
-#include "sha1.h"
+#include "smallsha1/sha1.h"
 #include "cppcodec/base64_default_rfc4648.hpp"
 #include "httpparser/request.h"
 #include "httpparser/httprequestparser.h"
-#include "http/header.hpp"
-#include "http/response.hpp"
-#include "http/status_code.hpp"
+#include "wscpp/http/header.hpp"
+#include "wscpp/http/response.hpp"
+#include "wscpp/http/status_code.hpp"
 #include "asio.hpp"
-#include "protocol/frame.hpp"
+#include "wscpp/protocol/frame.hpp"
 #include "uuid.h"
 
 using asio::ip::tcp;
@@ -105,8 +105,6 @@ private:
     uint _keepalive_interval;
     uint _keepalive_timeout;
 
-
-    std::vector<protocol::frame> _frames;
     std::mutex _read_mutex;
     std::mutex _write_mutex;
 
@@ -114,9 +112,12 @@ private:
     std::vector<uint8_t> _ping_payload;
 
     bool _write_in_progress;
+    std::vector<protocol::frame> _frames;
     std::deque<protocol::frame> _write_frames;
     std::optional<const protocol::frame> _write_hold_frame;
     std::optional<protocol::enums::opcode> _current_opcode;
+
+    bool _close_frame_sent;
 };
 
 void websocket_connection::set_binary_message_handler(std::function<void (std::vector<uint8_t>)> handler) {
@@ -168,7 +169,6 @@ websocket_connection::websocket_connection(params p) :
     _close_handler([](auto, auto) {}),
     _text_handler([](auto) {}),
     _write_in_progress(false),
-    _close_sent(false),
     _id(generate_uuid()),
     _io_context(p.io_context),
     _handshake_timer(p.io_context),
@@ -176,7 +176,8 @@ websocket_connection::websocket_connection(params p) :
     _keepalive_timeout_timer(p.io_context),
     _handshake_timeout(p.handshake_timeout),
     _keepalive_interval(p.keepalive_interval),
-    _keepalive_timeout(p.keepalive_timeout)
+    _keepalive_timeout(p.keepalive_timeout),
+    _close_frame_sent(false)
 {};
 
 void websocket_connection::handshake_timeout_handler(const asio::error_code& ec)
@@ -333,16 +334,22 @@ void websocket_connection::frame_handler(const asio::error_code& ec, std::size_t
                     }
                     break;
                 case opcode::close:
-                    if (_close_sent) {
-                        // If we've already sent a close frame then this is just
-                        // the response to that close frame. We may close the
-                        // socket connection now.
-                        close_connection("Closing socket connection");
-                    } else {
-                        auto status_code = parse_close_status_code(frame);
-                        auto status_reason = parse_close_status_reason(frame);
-                        // The opposite party wants to close the connection.
-                        _close_handler(status_code, status_reason);
+                    {
+                        // Need to get the write lock here to ensure we don't
+                        // have a race between the endpoint sending the close
+                        // frame and receiving another close frame.
+                        std::scoped_lock lock_guard(_write_mutex);
+                        if (_close_frame_sent) {
+                            // If we've already sent a close frame then this is just
+                            // the response to that close frame. We may close the
+                            // socket connection now.
+                            close_connection("Closing socket connection");
+                        } else {
+                            auto status_code = parse_close_status_code(frame);
+                            auto status_reason = parse_close_status_reason(frame);
+                            // The opposite party wants to close the connection.
+                            _close_handler(status_code, status_reason);
+                        }
                     }
                 case opcode::continuation:
                     if (!_current_opcode.has_value()) {
@@ -535,11 +542,15 @@ void websocket_connection::write_pending_frames() {
 
         if (!ec) {
             if (_write_hold_frame->get_terminate()) {
+                // If the terminate boolean is set on the frame, the socket
+                // connection should be closed
                 _socket.cancel();
                 _socket.close();
 
                 // TODO: Call websocket terminate handler
             } else if (_write_frames.size() > 0) {
+                // If there are more pending frames to write, call the method
+                // again
                 write_pending_frames();
             }
         } else if (ec.value() != asio::error::operation_aborted) {
@@ -548,12 +559,30 @@ void websocket_connection::write_pending_frames() {
     });
 };
 
+/**
+ * @brief Send a close frame with a status code. Optionally close the socket
+ * connection once the frame has been sent.
+ *
+ * @param close_status_code Close status code as defined in RFC6455
+ * @param terminate A boolean indicating whether to close the socket connection
+ * after the close frame is sent.
+ */
 void websocket_connection::send_close_frame(short unsigned int close_status_code, bool terminate) {
     auto close_frame = protocol::make_close_frame(close_status_code);
+
+    // Set the terminate flag on the frame so that the write method knows to
+    // close the socket connection once the frame has been sent.
     close_frame.set_terminate(terminate);
 
     std::lock_guard lock(_write_mutex);
 
+    if (_close_frame_sent) {
+        return;
+    }
+    _close_frame_sent = true;
+
+    // Clear all frames that are waiting to be written. We won't be sending them
+    // anyway after the close frame is sent.
     _write_frames.clear();
     _write_frames.push_back(std::move(close_frame));
 
@@ -569,8 +598,6 @@ void websocket_connection::close(short unsigned int close_status_code) {
     _write_frames.push_back(std::move(close_frame));
 
     write_pending_frames();
-
-    asio::async_write(_socket,
 
     auto ptr = static_cast<const uint8_t*>(payload);
     auto payload_end = ptr + length;
