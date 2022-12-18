@@ -36,9 +36,24 @@ namespace wscpp {
 
 using protocol::enums::opcode;
 
+enum class connection_type {
+    server,
+    client
+};
+
+enum class connection_state {
+    pending,
+    handshake,
+    open,
+    closing,
+    closed
+};
+
 struct params {
     asio::io_context& io_context;
     tcp::socket socket;
+    connection_type connection_type;
+    uint close_wait_timeout = 5;
     uint handshake_timeout = 5;
     uint keepalive_interval = 20;
     uint keepalive_timeout = 10;
@@ -81,6 +96,7 @@ private:
     protocol::frame& current_frame();
     void frame_handler(const asio::error_code& ec, std::size_t bytes_transferred);
     void handshake_handler(const asio::error_code& ec, std::size_t bytes_transferred);
+    void close_wait_timeout_handler(const asio::error_code& ec);
     void handshake_timeout_handler(const asio::error_code& ec);
     void keepalive_handler(const asio::error_code& ec);
     void send_close_frame(bool terminate);
@@ -98,9 +114,11 @@ private:
     std::function<void (std::string)> _text_handler;
 
     // timers and timeouts
+    asio::steady_timer _close_wait_timer;
     asio::steady_timer _handshake_timer;
     asio::steady_timer _keepalive_timer;
     asio::steady_timer _keepalive_timeout_timer;
+    uint _close_wait_timeout;
     uint _handshake_timeout;
     uint _keepalive_interval;
     uint _keepalive_timeout;
@@ -118,6 +136,9 @@ private:
     std::optional<protocol::enums::opcode> _current_opcode;
 
     bool _close_frame_sent;
+
+    connection_type _connection_type;
+    connection_state _connection_state;
 };
 
 void websocket_connection::set_binary_message_handler(std::function<void (std::vector<uint8_t>)> handler) {
@@ -130,6 +151,8 @@ void websocket_connection::set_text_message_handler(std::function<void (std::str
 
 void websocket_connection::start()
 {
+    std::scoped_lock lock_guard(_write_mutex);
+    _connection_state = connection_state::handshake;
     _handshake_timer.expires_after(std::chrono::seconds(_handshake_timeout));
     _handshake_timer.async_wait(std::bind(&websocket_connection::handshake_timeout_handler, this, _1));
     _socket.async_read_some(asio::buffer(_buffer, buffer_size), std::bind(&websocket_connection::handshake_handler, this, _1, _2));
@@ -171,14 +194,35 @@ websocket_connection::websocket_connection(params p) :
     _write_in_progress(false),
     _id(generate_uuid()),
     _io_context(p.io_context),
+    _close_wait_timer(p.io_context),
     _handshake_timer(p.io_context),
     _keepalive_timer(p.io_context),
+    _close_wait_timeout(p.close_wait_timeout),
     _keepalive_timeout_timer(p.io_context),
     _handshake_timeout(p.handshake_timeout),
     _keepalive_interval(p.keepalive_interval),
     _keepalive_timeout(p.keepalive_timeout),
-    _close_frame_sent(false)
+    _close_frame_sent(false),
+    _connection_type(p.connection_type),
+    _connection_state(connection_state::pending)
 {};
+
+/**
+ * @brief Called after the client has waited longer than the timeout for the
+ * server to shut down the socket connection.
+ *
+ * @param ec 
+ */
+void websocket_connection::close_wait_timeout_handler(const asio::error_code& ec)
+{
+    if (!ec) {
+        std::scoped_lock lock_guard(_write_mutex);
+        if (_connection_state != connection_state::closed) {
+            _socket.shutdown(_socket.shutdown_both);
+            _connection_state = connection_state::closed;
+        }
+    }
+};
 
 void websocket_connection::handshake_timeout_handler(const asio::error_code& ec)
 {
@@ -542,10 +586,21 @@ void websocket_connection::write_pending_frames() {
 
         if (!ec) {
             if (_write_hold_frame->get_terminate()) {
-                // If the terminate boolean is set on the frame, the socket
-                // connection should be closed
-                _socket.cancel();
-                _socket.close();
+                // If the terminate boolean is set on the frame and this is the
+                // server-side of the connection, the socket connection should
+                // be closed 
+                if (_connection_type == connection_type::server) {
+                    _socket.shutdown(_socket.shutdown_both);
+                } else {
+                    // In the case of the client-side of the connection, set a
+                    // timeout and wait for the server-side to shut down the socket.
+                    // Once the socket shuts down a asio::error::eof is received by
+                    // the frame_handler. At this point, the client may also call
+                    // shutdown and destroy the socket. If the server takes longer
+                    // than the timeout, the socket will be shut down.
+                    _close_wait_timer.expires_after(std::chrono::seconds(_close_wait_timeout));
+                    _close_wait_timer.async_wait(std::bind(&websocket_connection::close_wait_timeout_handler, this, _1));
+                }
 
                 // TODO: Call websocket terminate handler
             } else if (_write_frames.size() > 0) {
