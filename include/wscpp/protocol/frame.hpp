@@ -160,7 +160,7 @@ auto make_close_frame(short unsigned int close_status_code) {
     converter.u16 = close_status_code;
     uint8_t* payload = converter.u8;
 
-    return frame(std::move(std::vector(payload, payload + 2)), 2, opcode::close, true);
+    return frame(std::move(std::vector(payload, payload + 2)), 2, enums::opcode::close, true);
 };
 
 };
