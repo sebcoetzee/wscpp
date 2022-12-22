@@ -9,6 +9,8 @@
 #include "asio.hpp"
 #endif
 
+#include "converters.hpp"
+
 namespace wscpp {
 namespace protocol {
 
@@ -154,6 +156,7 @@ struct basic_header {
 
 struct extended_payload_length {
     extended_payload_length(uint8_t initial_length) {
+        _buff.u64 = 0;
         if (initial_length == 126) {
             _bytes_needed = 4;
             _buff_size = 4;
@@ -182,15 +185,14 @@ struct extended_payload_length {
     std::size_t consume(uint8_t const * buffer, std::size_t bytes_available) {
         std::size_t bytes_consumed = 0;
         while (_bytes_needed > 0 && bytes_available > 0) {
-            _buff[8 - _bytes_needed] = *buffer;
+            _buff.u8[8 - _bytes_needed] = *buffer;
             _bytes_needed--;
             bytes_available--;
             bytes_consumed++;
+            buffer++;
         }
         if (completed()) {
-            for (std::size_t i = _buff_size; i > 0; i--) {
-                _payload_length = _payload_length | (static_cast<uint64_t>(_buff[_buff_size - i]) << (8 * (i - 1)));
-            }
+            _payload_length = _buff.u64;
         }
         return bytes_consumed;
     }
@@ -212,7 +214,7 @@ struct extended_payload_length {
         }
     }
 
-    uint8_t _buff[8];
+    uint64_t_to_uint8_t _buff;
     std::size_t _buff_size;
     uint64_t _payload_length;
     std::size_t _bytes_needed;

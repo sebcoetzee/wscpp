@@ -158,7 +158,7 @@ private:
 auto make_close_frame(short unsigned int close_status_code) {
     uint16_t_to_uint8_t converter;
     converter.u16 = close_status_code;
-    uint8_t* payload = converter.u8;
+    uint8_t payload[2] = {converter.u8[1], converter.u8[0]};
 
     return frame(std::move(std::vector(payload, payload + 2)), 2, enums::opcode::close, true);
 };
