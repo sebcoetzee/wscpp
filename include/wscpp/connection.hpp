@@ -124,8 +124,8 @@ private:
     uint _keepalive_interval;
     uint _keepalive_timeout;
 
-    std::mutex _read_mutex;
-    std::mutex _write_mutex;
+    std::recursive_mutex _read_mutex;
+    std::recursive_mutex _write_mutex;
 
     // Ping payload of the last ping that was sent on this connection
     std::vector<uint8_t> _ping_payload;
