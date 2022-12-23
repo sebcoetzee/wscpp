@@ -5,6 +5,7 @@
 #include <memory>
 #include <iostream>
 #include <optional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -28,15 +29,17 @@ enum class frame_state {
 
 class frame {
 public:
-    frame() : _state(frame_state::basic_header), _basic_header(basic_header()), _terminate(false) {};
+    frame() : _state(frame_state::basic_header), _basic_header(basic_header()), _extended_payload_length(std::nullopt) {};
     frame(std::vector<uint8_t> payload, const std::size_t payload_length, const enums::opcode opcode, bool fin):
         _state(frame_state::payload),
         _basic_header(fin, false, false, false, opcode, false, payload_length > 65535 ? 127 : payload_length > 125 ? 126 : payload_length),
         _payload(std::move(payload)),
-        _terminate(false)
+        _payload_length(payload_length)
     {
         if (payload_length > 125) {
             _extended_payload_length.emplace(payload_length);
+        } else {
+            _extended_payload_length = std::nullopt;
         }
     };
 
@@ -148,11 +151,11 @@ public:
 private:
     frame_state _state;
     basic_header _basic_header;
-    std::optional<extended_payload_length> _extended_payload_length = std::nullopt;
+    std::optional<extended_payload_length> _extended_payload_length;
     std::size_t _payload_length;
     std::optional<masking_key> _masking_key = std::nullopt;
     std::optional<payload> _payload = std::nullopt;
-    bool _terminate;
+    bool _terminate = false;
 };
 
 auto make_close_frame(short unsigned int close_status_code) {
@@ -161,6 +164,16 @@ auto make_close_frame(short unsigned int close_status_code) {
     uint8_t payload[2] = {converter.u8[1], converter.u8[0]};
 
     return frame(std::move(std::vector(payload, payload + 2)), 2, enums::opcode::close, true);
+};
+
+auto make_ping_frame() {
+    std::vector<uint8_t> payload;
+    for (std::size_t i = 0; i < 4; i++)
+    {
+        payload.emplace_back(rand() % 0xff);
+    }
+
+    return frame(std::move(payload), payload.size(), enums::opcode::close, true);
 };
 
 };
