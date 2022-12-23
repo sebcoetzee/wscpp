@@ -1,8 +1,6 @@
 #include <functional>
 #include <iostream>
 #include <memory>
-// #include <utility>
-// #include <type_traits>
 #include <chrono>
 #include <mutex>
 #include <deque>
@@ -63,34 +61,17 @@ public:
     websocket_connection(params p);
     tcp::socket& socket();
 
-    void set_binary_message_handler(std::function<void (std::vector<uint8_t>)> handler);
-    void set_close_handler(std::function<void ()> handler);
-    void set_text_message_handler(std::function<void (std::string)> handler);
     void start();
-
-    /**
-     * @brief Write a text frame to the websocket connection. This frame is
-     * pushed to the back of the queue of pending frames. This method acquires
-     * the connection's write lock.
-     *
-     * @param payload String message body.
-     */
     void write(const std::string payload);
-
-    /**
-     * @brief Write a binary frame to the websocket connection. This frame is
-     * pushed to the back of the queue of pending frames. This method acquires
-     * the connection's write lock.
-     * 
-     * @param payload Raw pointer to data array that will be copied into the frame.
-     * @param length Length of the data to be copied.
-     */
     void write(const void* payload, std::size_t length);
-
     void close(short unsigned int close_status_code);
 
-    uuids::uuid _id;
-    // void write(const void* payload, size_t len);
+    void set_binary_message_handler(std::function<void (std::vector<uint8_t>)> handler);
+    void set_close_handler(std::function<void (std::optional<short unsigned int> status_code, std::string reason)> handler);
+    void set_text_message_handler(std::function<void (std::string)> handler);
+
+    uuids::uuid id();
+
 private:
     protocol::frame& current_frame();
 
@@ -99,6 +80,7 @@ private:
     void continuation_frame_handler(protocol::frame& frame);
     void ping_frame_handler(protocol::frame& frame);
     void pong_frame_handler(protocol::frame& frame);
+    void text_frame_handler(protocol::frame& frame);
 
     void frame_handler(const asio::error_code& ec, std::size_t bytes_transferred);
     void handshake_handler(const asio::error_code& ec, std::size_t bytes_transferred);
@@ -119,7 +101,7 @@ private:
     tcp::socket _socket;
     asio::io_context& _io_context;
     std::function<void (std::vector<uint8_t>)> _binary_handler;
-    std::function<void (std::optional<int> status_code, std::string reason)> _close_handler;
+    std::function<void (std::optional<short unsigned int> status_code, std::string reason)> _close_handler;
     std::function<void (std::string)> _text_handler;
 
     // timers and timeouts
@@ -147,18 +129,25 @@ private:
 
     connection_type _connection_type;
     connection_state _connection_state;
+
+    uuids::uuid _id;
 };
 
 void websocket_connection::set_binary_message_handler(std::function<void (std::vector<uint8_t>)> handler) {
     _binary_handler = handler;
 };
 
+
+void websocket_connection::set_close_handler(std::function<void (std::optional<short unsigned int> status_code, std::string reason)> handler) {
+    _close_handler = handler;
+};
+
+
 void websocket_connection::set_text_message_handler(std::function<void (std::string)> handler) {
     _text_handler = handler;
 };
 
-void websocket_connection::start()
-{
+void websocket_connection::start() {
     std::scoped_lock lock_guard(_mutex);
     _connection_state = connection_state::handshake;
     _handshake_timer.expires_after(std::chrono::seconds(_handshake_timeout));
@@ -166,23 +155,24 @@ void websocket_connection::start()
     _socket.async_read_some(asio::buffer(_buffer, buffer_size), std::bind(&websocket_connection::handshake_handler, this, _1, _2));
 };
 
-void websocket_connection::start_keepalive()
-{
+void websocket_connection::start_keepalive() {
     _keepalive_timer.expires_after(std::chrono::seconds(_keepalive_interval));
     _keepalive_timer.async_wait(std::bind(&websocket_connection::keepalive_handler, this, _1));
 };
 
-void websocket_connection::start_reading()
-{
+void websocket_connection::start_reading() {
     _socket.async_read_some(asio::buffer(_buffer, buffer_size), std::bind(&websocket_connection::frame_handler, this, _1, _2));
 };
 
-tcp::socket& websocket_connection::socket()
-{
+tcp::socket& websocket_connection::socket() {
     return _socket;
 };
 
-inline uuid generate_uuid() {
+uuids::uuid websocket_connection::id() {
+    return _id;
+}
+
+uuid generate_uuid() {
     std::random_device rd;
     auto seed_data = std::array<int, std::mt19937::state_size> {};
     std::generate(std::begin(seed_data), std::end(seed_data), std::ref(rd));
@@ -232,11 +222,22 @@ void websocket_connection::close_wait_timeout_handler(const asio::error_code& ec
     }
 };
 
+/**
+ * @brief Handler that is called when the handshake takes longer than the
+ * timeout. Since there is no websocket connection at this point, the socket is
+ * closed and the connection state is changed to closed.
+ *
+ * @param ec 
+ */
 void websocket_connection::handshake_timeout_handler(const asio::error_code& ec)
 {
     if (!ec) {
-        std::cout << "Handshake timed out\n";
+        std::cout << "Handshake timed out. Closing connection.\n";
         std::scoped_lock lock_guard(_mutex);
+
+        // Since the connection failed to establish a websocket connection, it
+        // is under no obligation to send a close frame before shutting down the
+        // socket.
         _socket.shutdown(_socket.shutdown_both);
         _connection_state = connection_state::closed;
     }
@@ -262,7 +263,9 @@ void websocket_connection::set_keepalive_timeout() {
 void websocket_connection::keepalive_timeout_handler(const asio::error_code& ec) {
     if (!ec) {
         std::lock_guard lock_guard(_mutex);
-        send_close_frame(protocol::close_status_code::protocol_error, false);
+        if (_connection_state != connection_state::closed) {
+            send_close_frame(protocol::close_status_code::protocol_error, false);
+        }
     }
 };
 
@@ -381,7 +384,7 @@ std::optional<short unsigned int> parse_close_status_code(protocol::frame& frame
 
 /**
  * @brief Handle a binary frame that was received over the connection. Some
- * error handling is done to check if the connection is in the correct state to
+ * state checking is done to check if the connection is in the correct state to
  * receive a binary frame.
  *
  * @param frame 
@@ -536,6 +539,34 @@ void websocket_connection::continuation_frame_handler(protocol::frame& frame) {
 };
 
 
+/**
+ * @brief Handle a text frame that was received over the connection. Some state
+ * checking is done to check if the connection is in the correct state to
+ * receive a text frame.
+ *
+ * @param frame 
+ */
+void websocket_connection::text_frame_handler(protocol::frame& frame) {
+    if (_current_opcode) {
+        std::cerr << "New text frame received while still processing continuation frames. Closing the connection.\n";
+        send_close_frame(protocol::close_status_code::protocol_error, false);
+        return;
+    } else if (frame.final()) {
+        // If the frame is final then we needn't worry about setting the _current_opcode.
+        std::string payload{};
+        auto& frame_data = frame.data();
+        for (size_t j = 0; j < frame_data.size(); j++)
+        {
+            payload.push_back(frame_data[j]);
+        }
+        _text_handler(std::move(payload));
+        _frames.pop_back();
+    } else {
+        _current_opcode.emplace(opcode::text);
+    }
+};
+
+
 void websocket_connection::frame_handler(const asio::error_code& ec, std::size_t bytes_transferred)
 {
     if (!ec) {
@@ -565,30 +596,10 @@ void websocket_connection::frame_handler(const asio::error_code& ec, std::size_t
                     ping_frame_handler(frame);
                     break;
                 case opcode::pong:
-                    // TODO: Implement a pong handler
+                    pong_frame_handler(frame);
                     break;
-
                 case opcode::text:
-                    if (_current_opcode) {
-                        std::cerr << "New text frame received while still processing continuation frames\n";
-                        
-                        // TODO: Should we instead be trying to do a proper
-                        // close handshake here with an acknowledgement?
-                        send_close_frame(protocol::close_status_code::protocol_error, true);
-                        return;
-                    } else if (frame.final()) {
-                        // If the frame is final then we needn't worry about setting the _current_opcode.
-                        std::string payload{};
-                        auto& frame_data = frame.data();
-                        for (size_t j = 0; j < frame_data.size(); j++)
-                        {
-                            payload.push_back(frame_data[j]);
-                        }
-                        _text_handler(std::move(payload));
-                        _frames.pop_back();
-                    } else {
-                        _current_opcode.emplace(opcode::binary);
-                    }
+                    text_frame_handler(frame);
                     break;
                 default:
                     break;
@@ -604,6 +615,7 @@ void websocket_connection::frame_handler(const asio::error_code& ec, std::size_t
             std::cout << "Got EOF on closing connection. Calling shutdown on the underlying socket.\n";
             _close_wait_timer.cancel();
             _socket.shutdown(_socket.shutdown_both);
+            _connection_state = connection_state::closed;
             return;
         }
     } else {
@@ -614,6 +626,13 @@ void websocket_connection::frame_handler(const asio::error_code& ec, std::size_t
 };
 
 
+/**
+ * @brief Write a string payload to the connection. This string payload will be
+ * broken down into a text frame and potentially multiple continuation frames if
+ * the payload is bigger than the max_frame_size.
+ *
+ * @param message 
+ */
 void websocket_connection::write(const std::string message) {
     std::vector<protocol::frame> frames;
     auto first_frame(true);
@@ -622,12 +641,6 @@ void websocket_connection::write(const std::string message) {
         auto end = std::min(ptr + max_frame_size, message.end());
         auto last_frame = end == message.end();
         std::vector<uint8_t> payload(ptr, end);
-        protocol::frame frame(
-            std::move(payload),
-            payload.size(),
-            first_frame ? protocol::enums::opcode::text : protocol::enums::opcode::continuation,
-            last_frame
-        );
         frames.emplace_back(
             std::move(payload),
             payload.size(),
@@ -648,6 +661,15 @@ void websocket_connection::write(const std::string message) {
     write_pending_frames();
 };
 
+
+/**
+ * @brief Write a binary payload to the connection. If the binary payload
+ * exceeds the max_frame_size, the binary payload will automatically be broken
+ * up into a binary frame and potentially multiple continuation frames.
+ *
+ * @param payload 
+ * @param length 
+ */
 void websocket_connection::write(const void* payload, std::size_t length) {
     std::vector<protocol::frame> frames;
     auto first_frame(true);
@@ -711,6 +733,7 @@ void websocket_connection::write_pending_frames() {
                 // be closed 
                 if (_connection_type == connection_type::server) {
                     _socket.shutdown(_socket.shutdown_both);
+                    _connection_state = connection_state::closed;
                 } else {
                     set_close_wait_timeout();
                 }
@@ -754,7 +777,7 @@ void websocket_connection::send_close_frame(short unsigned int close_status_code
     if (terminate) {
         // Set the terminate flag on the frame so that the write method knows to
         // close the socket connection once the frame has been sent.
-        close_frame.set_terminate(terminate);
+        close_frame.set_terminate(true);
     } else {
         set_close_wait_timeout();
     }
@@ -770,6 +793,7 @@ void websocket_connection::send_close_frame(short unsigned int close_status_code
 };
 
 void websocket_connection::close(short unsigned int close_status_code) {
+    std::lock_guard lock(_mutex);
     send_close_frame(close_status_code, false);
 };
 

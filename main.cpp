@@ -56,15 +56,17 @@ void tcp_server::remove_connection(std::shared_ptr<websocket_connection> websock
     std::cout << "Connections: " << _websocket_connections.size() << std::endl;
 }
 
-void text_handler(std::string message) {
-    std::cout << "Handling text message" << std::endl;
-    std::cout << message << std::endl;
+void text_handler(std::shared_ptr<websocket_connection> connection, std::string message) {
+    std::cout << "Handling text message.\n";
+    std::cout << message << "\n";
+    std::cout << "Sending the same message payload back to the client.\n";
+    connection->write(message);
 }
 
 void tcp_server::accept_callback_handler(const asio::error_code& ec, tcp::socket&& socket) {
     std::cout << "New connection: " << socket.remote_endpoint().address() << ":" << socket.remote_endpoint().port() << std::endl;
     std::shared_ptr<websocket_connection> connection(new websocket_connection({.io_context = _io_context, .socket = std::move(socket)}));
-    connection->set_text_message_handler(text_handler);
+    connection->set_text_message_handler(std::bind(text_handler, connection, std::placeholders::_1));
     connection->start();
     this->_websocket_connections.insert(connection);
 
