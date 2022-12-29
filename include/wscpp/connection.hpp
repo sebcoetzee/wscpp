@@ -33,11 +33,20 @@ namespace wscpp {
 
 using protocol::enums::opcode;
 
+/**
+ * @brief Different rules apply, especially with regards to closing of
+ * connections when the connection is either the client or the server-side.
+ *
+ */
 enum class connection_type {
     server,
     client
 };
 
+/**
+ * @brief The connection can be in strictly one of 5 different states.
+ *
+ */
 enum class connection_state {
     pending,
     handshake,
@@ -46,6 +55,11 @@ enum class connection_state {
     closed
 };
 
+/**
+ * @brief Parameters that can be passed to the constructor of a
+ * websocket_connection.
+ *
+ */
 struct params {
     asio::io_context& io_context;
     tcp::socket socket;
@@ -59,7 +73,6 @@ struct params {
 class websocket_connection {
 public:
     websocket_connection(params p);
-    tcp::socket& socket();
 
     void start();
     void write(const std::string payload);
@@ -84,11 +97,14 @@ private:
 
     void frame_handler(const asio::error_code& ec, std::size_t bytes_transferred);
     void handshake_handler(const asio::error_code& ec, std::size_t bytes_transferred);
+
     void close_wait_timeout_handler(const asio::error_code& ec);
     void handshake_timeout_handler(const asio::error_code& ec);
+
     void keepalive_handler(const asio::error_code& ec);
+
     void send_close_frame(short unsigned int close_status_code, bool terminate);
-    void set_close_wait_timeout();
+    void start_close_wait_timeout();
     void start_keepalive();
     void start_reading();
     void queue_write_frame(protocol::frame frame);
@@ -133,6 +149,29 @@ private:
     uuids::uuid _id;
 };
 
+websocket_connection::websocket_connection(params p) :
+    _current_opcode(std::nullopt),
+    _socket(std::move(p.socket)),
+    _buffer(buffer_size),
+    _binary_handler([](auto) {}),
+    _close_handler([](auto, auto) {}),
+    _text_handler([](auto) {}),
+    _write_in_progress(false),
+    _id(generate_uuid()),
+    _io_context(p.io_context),
+    _close_wait_timer(p.io_context),
+    _handshake_timer(p.io_context),
+    _keepalive_timer(p.io_context),
+    _close_wait_timeout(p.close_wait_timeout),
+    _keepalive_timeout_timer(p.io_context),
+    _handshake_timeout(p.handshake_timeout),
+    _keepalive_interval(p.keepalive_interval),
+    _keepalive_timeout(p.keepalive_timeout),
+    _connection_type(p.con_type),
+    _connection_state(connection_state::pending),
+    _ping_frame_payload()
+{};
+
 void websocket_connection::set_binary_message_handler(std::function<void (std::vector<uint8_t>)> handler) {
     _binary_handler = handler;
 };
@@ -164,10 +203,6 @@ void websocket_connection::start_reading() {
     _socket.async_read_some(asio::buffer(_buffer, buffer_size), std::bind(&websocket_connection::frame_handler, this, _1, _2));
 };
 
-tcp::socket& websocket_connection::socket() {
-    return _socket;
-};
-
 uuids::uuid websocket_connection::id() {
     return _id;
 }
@@ -181,29 +216,6 @@ uuid generate_uuid() {
     uuids::uuid_random_generator gen{generator};
     return gen();
 };
-
-websocket_connection::websocket_connection(params p) :
-    _current_opcode(std::nullopt),
-    _socket(std::move(p.socket)),
-    _buffer(buffer_size),
-    _binary_handler([](auto) {}),
-    _close_handler([](auto, auto) {}),
-    _text_handler([](auto) {}),
-    _write_in_progress(false),
-    _id(generate_uuid()),
-    _io_context(p.io_context),
-    _close_wait_timer(p.io_context),
-    _handshake_timer(p.io_context),
-    _keepalive_timer(p.io_context),
-    _close_wait_timeout(p.close_wait_timeout),
-    _keepalive_timeout_timer(p.io_context),
-    _handshake_timeout(p.handshake_timeout),
-    _keepalive_interval(p.keepalive_interval),
-    _keepalive_timeout(p.keepalive_timeout),
-    _connection_type(p.con_type),
-    _connection_state(connection_state::pending),
-    _ping_frame_payload()
-{};
 
 /**
  * @brief Called after the client has waited longer than the timeout for the
@@ -281,22 +293,34 @@ void websocket_connection::keepalive_handler(const asio::error_code& ec) {
     }
 };
 
-const std::string EMPTY_STRING = "";
-
-inline const std::string& sec_websocket_key(const std::vector<httpparser::Request::HeaderItem>& headers) {
-    for (std::size_t i = 0; i < headers.size(); i++) {
-        if (headers[i].name == "Sec-WebSocket-Key") {
-            return headers[i].value;
+/**
+ * @brief Search through the headers and return the value of the
+ * 'Sec-Websocket-Key' header
+ *
+ * @param headers 
+ * @return std::string 
+ */
+auto sec_websocket_key(const std::vector<httpparser::Request::HeaderItem>& headers) {
+    for (auto& header : headers) {
+        if (header.name == "Sec-WebSocket-Key") {
+            return header.value;
         }
     }
-    return EMPTY_STRING;
+    return "";
 };
 
-inline auto create_sec_websocket_accept(const std::string& sec_websocket_key) {
+/**
+ * @brief Create the Sec-Websocket-Accept header value that is sent as a
+ * response to finish the handshake.
+ *
+ * @param sec_websocket_key 
+ * @return auto 
+ */
+auto create_sec_websocket_accept(const std::string& sec_websocket_key) {
     std::string raw_sec_websocket_accept = sec_websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    std::vector<unsigned char> hash(20);
-    sha1::calc(raw_sec_websocket_accept.data(), raw_sec_websocket_accept.size(), hash.data());
-    return base64::encode(hash.data(), 20);
+    unsigned char hash[20];
+    sha1::calc(raw_sec_websocket_accept.data(), raw_sec_websocket_accept.size(), hash);
+    return base64::encode(hash, 20);
 };
 
 void websocket_connection::handshake_handler(const asio::error_code& ec, std::size_t bytes_transferred)
@@ -306,12 +330,14 @@ void websocket_connection::handshake_handler(const asio::error_code& ec, std::si
         Request request;
         HttpRequestParser parser;
 
-        HttpRequestParser::ParseResult res = parser.parse(request, reinterpret_cast<const char *>(_buffer.data()), reinterpret_cast<const char *>(_buffer.data()) + bytes_transferred);
-        if (res == HttpRequestParser::ParseResult::ParsingCompleted)
-        {
-            std::cout << request.inspect() << std::endl;
+        HttpRequestParser::ParseResult res = parser.parse(
+            request,
+            reinterpret_cast<const char *>(_buffer.data()),
+            reinterpret_cast<const char *>(_buffer.data()) + bytes_transferred
+        );
+        if (res == HttpRequestParser::ParseResult::ParsingCompleted) {
             if (request.method == "GET") {
-                auto& key = sec_websocket_key(request.headers);
+                const auto key = sec_websocket_key(request.headers);
                 if (key.empty()) {
                     std::cerr << "Handshake: No Sec-Websocket-Key sent in the handshake request\n";
                     std::scoped_lock lock_guard(_mutex);
@@ -320,14 +346,10 @@ void websocket_connection::handshake_handler(const asio::error_code& ec, std::si
                     return;
                 }
 
-                auto sec_websocket_accept = create_sec_websocket_accept(key);
-
-                std::cout << "Sec-Websocket-Accept: " << sec_websocket_accept << std::endl;
-
                 std::vector<http::header> headers;
-                headers.push_back(http::header("Upgrade", "websocket"));
-                headers.push_back(http::header("Connection", "Upgrade"));
-                headers.push_back(http::header("Sec-Websocket-Accept", std::move(sec_websocket_accept)));
+                headers.emplace_back(http::header("Upgrade", "websocket"));
+                headers.emplace_back(http::header("Connection", "Upgrade"));
+                headers.emplace_back(http::header("Sec-Websocket-Accept", create_sec_websocket_accept(key)));
                 http::response response(http::status_code::switching_protocols, std::move(headers), "");
                 asio::async_write(_socket, response.to_buffers(), [this](const std::error_code& ec, std::size_t){
                     start_reading();
@@ -427,7 +449,7 @@ void websocket_connection::close_frame_handler(protocol::frame& frame) {
             return;
         } else {
             std::cout << "Close frame received. Setting close wait timeout.\n";
-            set_close_wait_timeout();
+            start_close_wait_timeout();
             return;
         }
     } else {
@@ -735,7 +757,7 @@ void websocket_connection::write_pending_frames() {
                     _socket.shutdown(_socket.shutdown_both);
                     _connection_state = connection_state::closed;
                 } else {
-                    set_close_wait_timeout();
+                    start_close_wait_timeout();
                 }
 
                 // TODO: Call websocket terminate handler
@@ -758,7 +780,7 @@ void websocket_connection::write_pending_frames() {
  *  shutdown and destroy the socket. If the server takes longer
  *  than the timeout, the socket will be shut down.
  */
-void websocket_connection::set_close_wait_timeout() {
+void websocket_connection::start_close_wait_timeout() {
     _close_wait_timer.expires_after(std::chrono::seconds(_close_wait_timeout));
     _close_wait_timer.async_wait(std::bind(&websocket_connection::close_wait_timeout_handler, this, _1));
 };
@@ -779,7 +801,7 @@ void websocket_connection::send_close_frame(short unsigned int close_status_code
         // close the socket connection once the frame has been sent.
         close_frame.set_terminate(true);
     } else {
-        set_close_wait_timeout();
+        start_close_wait_timeout();
     }
 
     _connection_state = connection_state::closing;

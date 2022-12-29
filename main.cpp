@@ -24,8 +24,6 @@ using asio::ip::tcp;
 using namespace std::placeholders;
 using namespace httpparser;
 
-static unsigned int id_counter = 0;
-
 namespace wscpp {
 
 class tcp_server : public std::enable_shared_from_this<tcp_server> {
