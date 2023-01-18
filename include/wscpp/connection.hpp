@@ -16,6 +16,7 @@
 #include "wscpp/http/status_code.hpp"
 #include "asio.hpp"
 #include "wscpp/protocol/frame.hpp"
+#include "wscpp/logging.hpp"
 #include "uuid.h"
 
 using asio::ip::tcp;
@@ -149,6 +150,16 @@ private:
     uuids::uuid _id;
 };
 
+uuid generate_uuid() {
+    std::random_device rd;
+    auto seed_data = std::array<int, std::mt19937::state_size> {};
+    std::generate(std::begin(seed_data), std::end(seed_data), std::ref(rd));
+    std::seed_seq seq(std::begin(seed_data), std::end(seed_data));
+    std::mt19937 generator(seq);
+    uuids::uuid_random_generator gen{generator};
+    return gen();
+};
+
 websocket_connection::websocket_connection(params p) :
     _current_opcode(std::nullopt),
     _socket(std::move(p.socket)),
@@ -207,16 +218,6 @@ uuids::uuid websocket_connection::id() {
     return _id;
 }
 
-uuid generate_uuid() {
-    std::random_device rd;
-    auto seed_data = std::array<int, std::mt19937::state_size> {};
-    std::generate(std::begin(seed_data), std::end(seed_data), std::ref(rd));
-    std::seed_seq seq(std::begin(seed_data), std::end(seed_data));
-    std::mt19937 generator(seq);
-    uuids::uuid_random_generator gen{generator};
-    return gen();
-};
-
 /**
  * @brief Called after the client has waited longer than the timeout for the
  * server to shut down the socket connection.
@@ -244,7 +245,7 @@ void websocket_connection::close_wait_timeout_handler(const asio::error_code& ec
 void websocket_connection::handshake_timeout_handler(const asio::error_code& ec)
 {
     if (!ec) {
-        std::cout << "Handshake timed out. Closing connection.\n";
+        LOG_INFO("Handshake timed out. Closing connection.");
         std::scoped_lock lock_guard(_mutex);
 
         // Since the connection failed to establish a websocket connection, it
@@ -300,7 +301,7 @@ void websocket_connection::keepalive_handler(const asio::error_code& ec) {
  * @param headers 
  * @return std::string 
  */
-auto sec_websocket_key(const std::vector<httpparser::Request::HeaderItem>& headers) {
+std::string sec_websocket_key(const std::vector<httpparser::Request::HeaderItem>& headers) {
     for (auto& header : headers) {
         if (header.name == "Sec-WebSocket-Key") {
             return header.value;
@@ -339,7 +340,7 @@ void websocket_connection::handshake_handler(const asio::error_code& ec, std::si
             if (request.method == "GET") {
                 const auto key = sec_websocket_key(request.headers);
                 if (key.empty()) {
-                    std::cerr << "Handshake: No Sec-Websocket-Key sent in the handshake request\n";
+                    LOG_ERROR("No Sec-Websocket-Key sent in the handshake request");
                     std::scoped_lock lock_guard(_mutex);
                     _socket.shutdown(_socket.shutdown_both);
                     _connection_state = connection_state::closed;
@@ -352,30 +353,29 @@ void websocket_connection::handshake_handler(const asio::error_code& ec, std::si
                 headers.emplace_back(http::header("Sec-Websocket-Accept", create_sec_websocket_accept(key)));
                 http::response response(http::status_code::switching_protocols, std::move(headers), "");
                 asio::async_write(_socket, response.to_buffers(), [this](const std::error_code& ec, std::size_t){
-                    start_reading();
-                    start_keepalive();
                     if (!ec) {
-                        std::cout << "Message successfully sent" << std::endl;
+                        start_reading();
+                        start_keepalive();
                     } else {
-                        std::cout << "Error: " << ec << std::endl;
+                        LOG_ERROR("Error sending handshake response: " << ec.message());
                     }
                 });
             } else {
-                std::cerr << "Invalid request method: " << request.method << std::endl;
+                LOG_ERROR("Invalid request method: " << request.method);
                 std::scoped_lock lock_guard(_mutex);
                 _socket.shutdown(_socket.shutdown_both);
                 _connection_state = connection_state::closed;
                 return;
             }
         } else {
-            std::cerr << "Parsing Error: Closing the connection\n";
+            LOG_ERROR("Parsing Error: Closing the connection");
             std::scoped_lock lock_guard(_mutex);
             _socket.shutdown(_socket.shutdown_both);
             _connection_state = connection_state::closed;
             return;
         }
     } else {
-        std::cerr << "An error occurred while trying to handle the handshake: " << ec.message() << "\n";
+        LOG_ERROR("An error occurred while trying to handle the handshake: " << ec.message());
         std::scoped_lock lock_guard(_mutex);
         _socket.shutdown(_socket.shutdown_both);
         _connection_state = connection_state::closed;
@@ -413,7 +413,7 @@ std::optional<short unsigned int> parse_close_status_code(protocol::frame& frame
  */
 void websocket_connection::binary_frame_handler(protocol::frame& frame) {
     if (_current_opcode) {
-        std::cerr << "New binary frame received while still processing continuation frames. Sending Close frame.\n";
+        LOG_ERROR("New binary frame received while still processing continuation frames. Sending Close frame.");
         send_close_frame(protocol::close_status_code::protocol_error, false);
         return;
     } else if (frame.final()) {
@@ -444,11 +444,11 @@ void websocket_connection::close_frame_handler(protocol::frame& frame) {
         // case of the server, we may now shutdown the
         // socket.
         if (_connection_type == connection_type::server) {
-            std::cout << "Close frame received. Shutting down socket.\n";
+            LOG_DEBUG("Close frame received. Shutting down socket.");
             _socket.shutdown(_socket.shutdown_both);
             return;
         } else {
-            std::cout << "Close frame received. Setting close wait timeout.\n";
+            LOG_DEBUG("Close frame received. Setting close wait timeout.");
             start_close_wait_timeout();
             return;
         }
@@ -503,7 +503,7 @@ void websocket_connection::pong_frame_handler(protocol::frame& frame) {
     // If the pong response payload does not match the payload of the ping frame
     // that was sent out we should close the connection with a protocol error.
     if (frame_data != _ping_frame_payload) {
-        std::cerr << "Pong payload did not match payload of ping frame that was sent out. Closing the connection.\n";
+        LOG_ERROR("Pong payload did not match payload of ping frame that was sent out. Closing the connection.");
         send_close_frame(protocol::close_status_code::protocol_error, false);
     } else {
         // Restart the keepalive loop.
@@ -522,7 +522,7 @@ void websocket_connection::pong_frame_handler(protocol::frame& frame) {
  */
 void websocket_connection::continuation_frame_handler(protocol::frame& frame) {
     if (!_current_opcode) {
-        std::cerr << "Continuation frame received but no current opcode being processed. Closing connection.\n";
+        LOG_ERROR("Continuation frame received but no current opcode being processed. Closing connection.");
         send_close_frame(protocol::close_status_code::protocol_error, false);
         return;
     }
@@ -570,7 +570,7 @@ void websocket_connection::continuation_frame_handler(protocol::frame& frame) {
  */
 void websocket_connection::text_frame_handler(protocol::frame& frame) {
     if (_current_opcode) {
-        std::cerr << "New text frame received while still processing continuation frames. Closing the connection.\n";
+        LOG_ERROR("New text frame received while still processing continuation frames. Closing the connection.");
         send_close_frame(protocol::close_status_code::protocol_error, false);
         return;
     } else if (frame.final()) {
@@ -601,8 +601,7 @@ void websocket_connection::frame_handler(const asio::error_code& ec, std::size_t
             auto& frame = current_frame();
             bytes_consumed += frame.consume(_buffer.data() + bytes_consumed, bytes_transferred, frame_error);
             if (frame.completed()) {
-                std::cout << "Frame received\n";
-                std::cout << frame.to_string() << "\n";
+                LOG_INFO("Frame received: " << frame.to_string());
                 switch (frame.opcode())
                 {
                 case opcode::binary:
@@ -631,17 +630,17 @@ void websocket_connection::frame_handler(const asio::error_code& ec, std::size_t
         start_reading();
     } else if (ec.value() == asio::error::eof) {
         if (_connection_state == connection_state::closed) {
-            std::cout << "EOF from closed connection. Ignoring.\n";
+            LOG_DEBUG("EOF from closed connection. Ignoring.");
             return;
         } else if (_connection_state == connection_state::closing) {
-            std::cout << "Got EOF on closing connection. Calling shutdown on the underlying socket.\n";
+            LOG_DEBUG("Got EOF on closing connection. Calling shutdown on the underlying socket.");
             _close_wait_timer.cancel();
             _socket.shutdown(_socket.shutdown_both);
             _connection_state = connection_state::closed;
             return;
         }
     } else {
-        std::cerr << "An error occurred: " << ec.message() << "\n";
+        LOG_ERROR("An error occurred: " << ec.message() << "\n");
         _socket.shutdown(_socket.shutdown_both);
         return;
     }

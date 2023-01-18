@@ -16,6 +16,7 @@
 #include "converters.hpp"
 #include "header.hpp"
 #include "payload.hpp"
+#include "../logging.hpp"
 
 namespace wscpp {
 namespace protocol {
@@ -50,7 +51,7 @@ public:
                 _ptr += _basic_header.consume(buffer + _ptr, bytes_to_read - _ptr);
                 if (_basic_header.completed()) {
                     _payload_length = _basic_header.payload_length();
-                    std::cout << "Payload length: " << std::to_string(_payload_length) << std::endl;
+                    LOG_DEBUG("Payload length: " << std::to_string(_payload_length));
                     if (_payload_length > 125) {
                         _state = frame_state::extended_payload_length;
                         _extended_payload_length.emplace(_payload_length);
@@ -82,12 +83,7 @@ public:
             } else if (_state == frame_state::payload) {
                 _ptr += _payload->consume(buffer + _ptr, bytes_to_read - _ptr);
                 if(_payload->completed()) {
-                    std::cout << "Payload: ";
-                    for (std::size_t i = 0; i < _payload_length; i++) {
-                        std::cout << _payload->data()[i];
-                    }
-                    std::cout << std::endl;
-
+                    LOG_DEBUG("Payload: " << std::string(_payload->data().cbegin(), _payload->data().cend()));
                     return _ptr;
                 }
             }

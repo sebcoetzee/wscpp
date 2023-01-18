@@ -1,3 +1,5 @@
+#define WSCPP_LOG_LEVEL 3
+
 #include <functional>
 #include <array>
 #include <iostream>
